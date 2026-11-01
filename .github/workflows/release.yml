@@ -97,15 +97,16 @@ jobs:
               cp /tmp/cfst/cfst.exe /tmp/cfst/ip.txt dist/bin/
               curl -L -o dist/bin/cfst-LICENSE "https://raw.githubusercontent.com/XIU2/CloudflareSpeedTest/${CFST_VERSION}/LICENSE"
             fi
-            powershell Compress-Archive -Path dist/* -DestinationPath "${{ matrix.artifact }}.zip"
+            # 7z 打包(勿用 powershell Compress-Archive:bash 展开通配符后多余参数会被当成位置参数报错)
+            (cd dist && 7z a "../${{ matrix.artifact }}.zip" *)
           elif [ "$RUNNER_OS" == "macOS" ]; then
             mkdir dist
             cp "$BIN" dist/
-            zip -r "${{ matrix.artifact }}.zip" dist
+            (cd dist && zip -r "../${{ matrix.artifact }}.zip" .)
           else
             mkdir dist
             cp "$BIN" dist/
-            tar -czf "${{ matrix.artifact }}.tar.gz" dist
+            tar -czf "${{ matrix.artifact }}.tar.gz" -C dist .
           fi
 
       - uses: actions/upload-artifact@v4 # 任意触发都可下载构建产物
