@@ -1,0 +1,72 @@
+# 自动构建 + 发布:推送 v* 标签时在云端出 Windows(macOS)包并挂到 Release
+# 手动触发:仓库页 Actions → release → Run workflow(只构建上传,不发 Release)
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # 允许用内置 GITHUB_TOKEN 创建 Release
+
+env:
+  CFST_VERSION: v2.3.5 # 随包分发的 cfst 版本(GPL-3.0,须附带其 LICENSE)
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false # 一个平台失败不影响另一个
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: cf-hosts-gui-windows-x64
+          - os: macos-latest
+            artifact: cf-hosts-gui-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest 自带 VS 生成工具(MSVC 工具链,windows-sys/winresource 直接可用)
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2 # 缓存 ~/.cargo 与 target,二次构建快数倍
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked # 真实 cfst 集成测试在本机路径缺失时自动跳过
+
+      # ---- Windows 打包:exe + bin/(cfst.exe、ip.txt、cfst-LICENSE) ----
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist/bin
+          cp target/release/cf-hosts-gui.exe dist/
+          curl -L -o /tmp/cfst.zip "https://github.com/XIU2/CloudflareSpeedTest/releases/download/${CFST_VERSION}/cfst_windows_amd64.zip"
+          7z e -y /tmp/cfst.zip -o/tmp/cfst cfst.exe ip.txt
+          cp /tmp/cfst/cfst.exe /tmp/cfst/ip.txt dist/bin/
+          curl -L -o dist/bin/cfst-LICENSE "https://raw.githubusercontent.com/XIU2/CloudflareSpeedTest/${CFST_VERSION}/LICENSE"
+          powershell Compress-Archive -Path dist/* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # ---- macOS 打包:裸二进制(字体走系统 PingFang 探测) ----
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir dist
+          cp target/release/cf-hosts-gui dist/
+          zip -r "${{ matrix.artifact }}.zip" dist
+
+      - uses: actions/upload-artifact@v4 # 任意触发都可下载构建产物
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+      # ---- 推 tag 时创建 Release 并挂上所有平台的 zip ----
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.artifact }}.zip
+          generate_release_notes: true
