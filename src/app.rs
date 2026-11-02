@@ -407,7 +407,13 @@ impl CfApp {
                     d.pin_ip = Some(ip);
                 }
                 let _ = self.cfg.save();
-                self.status_msg = "已选定 IP;「把结果写入 hosts」后生效".into();
+                let job = WriteJob {
+                    mode: WriteMode::Replace,
+                    entries: bindings(&self.cfg, &self.results),
+                    meta: meta_line(&self.results[0]),
+                };
+                self.dispatch_write(ctx, job, "选定写入");
+                self.status_msg = "已选定 IP,正在写入 hosts…".into();
                 self.log.info(&self.status_msg);
             }
             Act::ClearPin(i) => {
@@ -415,8 +421,19 @@ impl CfApp {
                     d.pin_ip = None;
                 }
                 let _ = self.cfg.save();
-                self.status_msg = "已恢复自动跟随第一名;写入后生效".into();
-                self.log.info(&self.status_msg);
+                if self.results.is_empty() {
+                    self.status_msg = "已恢复自动跟随第一名;写入后生效".into();
+                    self.log.info(&self.status_msg);
+                } else {
+                    let job = WriteJob {
+                        mode: WriteMode::Replace,
+                        entries: bindings(&self.cfg, &self.results),
+                        meta: meta_line(&self.results[0]),
+                    };
+                    self.dispatch_write(ctx, job, "清除选定");
+                    self.status_msg = "已恢复自动跟随第一名,正在写入 hosts…".into();
+                    self.log.info(&self.status_msg);
+                }
             }
             Act::SaveConfig => {
                 let p = self.ui_cfst_path.trim().to_string();
@@ -963,7 +980,7 @@ impl CfApp {
         });
         ui.add_space(6.0);
         ui.label(
-            RichText::new("提示:添加/移除域名或修改选定后,点上方「把结果写入 hosts」生效。")
+            RichText::new("提示:添加/移除域名后,点上方「把结果写入 hosts」生效;「清除选定」会立即写入。")
                 .small()
                 .color(p.muted_fg),
         );
@@ -1039,7 +1056,7 @@ impl CfApp {
         // 绑定目标选择(与说明放在一起)
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("行内「选定」把该 IP 绑定到:");
+                ui.label("行内「选定写入」把该 IP 绑定并立即写入:");
                 let names: Vec<String> =
                     self.cfg.domains.iter().map(|d| d.name.clone()).collect();
                 if names.is_empty() {
@@ -1125,9 +1142,9 @@ impl CfApp {
                         });
                         row.col(|ui| {
                             let (label, style, tip) = if is_pinned {
-                                ("取消选定", BtnStyle::OkSoft, "取消选定,恢复自动跟随第一名")
+                                ("取消选定", BtnStyle::OkSoft, "取消选定,恢复自动跟随第一名并立即写入 hosts")
                             } else {
-                                ("选定", BtnStyle::Ghost, "把该 IP 绑定到上方选中的域名")
+                                ("选定写入", BtnStyle::Ghost, "把该 IP 绑定到上方选中的域名并立即写入 hosts")
                             };
                             if styled_button(ui, label, None, style, BtnSize::Small, true, tip)
                                 .clicked()
