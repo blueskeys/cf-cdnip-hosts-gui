@@ -1,6 +1,6 @@
 [package]
 name = "cf-hosts-gui"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "Cloudflare 优选 IP 管理工具:cfst 测速 + hosts 区块化管理 (egui)"
 

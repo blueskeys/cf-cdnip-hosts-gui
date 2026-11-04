@@ -1013,7 +1013,7 @@ impl CfApp {
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             let el = if privilege::is_elevated() { "管理员权限" } else { "普通权限" };
             ui.label(RichText::new(el).small().color(p.muted_fg));
-            ui.label(RichText::new("cf-hosts-gui v0.1").small().color(p.muted_fg));
+            ui.label(RichText::new(concat!("cf-hosts-gui v", env!("CARGO_PKG_VERSION"))).small().color(p.muted_fg));
             ui.add_space(2.0);
             let btn_label = if self.cfg.dark_mode { "切换浅色" } else { "切换深色" };
             if styled_button(ui, btn_label, None, BtnStyle::Ghost, BtnSize::Small, true, "")
@@ -1714,9 +1714,10 @@ fn apply_visuals(ctx: &egui::Context, dark: bool) {
         // 输入框/下拉底色
         s.visuals.widgets.inactive.weak_bg_fill = mix(p.deep, p.card, 0.7);
 
-        // 选中态(导航项/下拉/文本选区):accent 低饱和底 + ok 描边
-        s.visuals.selection.bg_fill = mix(p.card, p.accent, 0.28);
-        s.visuals.selection.stroke = egui::Stroke::new(1.0_f32, p.ok);
+        // 选中态(导航项/下拉/文本选区):accent 实底 + on_accent 前景。
+        // (此前 ok 绿字配暗绿底,同色系难辨,选中的字看不清)
+        s.visuals.selection.bg_fill = p.accent;
+        s.visuals.selection.stroke = egui::Stroke::new(1.0_f32, p.on_accent);
         s.visuals.hyperlink_color = p.ok;
 
         // 字号阶梯(13 / 14 / 15 / 20;整数避免半像素模糊,小字上调提升可读性)
@@ -2214,7 +2215,8 @@ fn window_icon() -> Option<egui::IconData> {
 // ---------- CJK 字体(egui 默认字体无中文;优先用体积小的黑体省内存) ----------
 
 fn setup_fonts(ctx: &egui::Context) {
-    // Windows:内嵌子集字体(仅 UI + cfst 输出用字,~178KB;未收录生僻字会显示为方框)
+    // Windows:内嵌子集字体(按 src/ 源码全部字符生成;新增 UI 文案后重跑
+    // tools/make_font_subset.py 再编译,否则新字符会显示为方框)
     #[cfg(windows)]
     let font_bytes: Option<Vec<u8>> =
         Some(include_bytes!("../assets/cjk-subset.ttf").to_vec());
@@ -2238,7 +2240,7 @@ fn setup_fonts(ctx: &egui::Context) {
     if let Some(bytes) = font_bytes {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(bytes));
-        // 回退字体:simhei 无 ✓✗⚠⚡ 等符号(会渲染成方框),用 seguisym 子集补
+        // 回退字体:雅黑无 ✓✗⚠⚡ 等符号(会渲染成方框),用 Segoe UI Symbol 子集补
         #[cfg(windows)]
         {
             fonts.font_data.insert(
