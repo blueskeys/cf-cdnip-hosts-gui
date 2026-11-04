@@ -78,14 +78,3 @@ pub fn elevate_write_hosts(job: &WriteJob) -> Result<WriteOutcome, String> {
     let json = serde_json::to_string(job).map_err(|e| e.to_string())?;
     elevate("--write-hosts", json)
 }
-
-/// 提权注册计划任务
-pub fn elevate_install_task(interval_hours: u32) -> Result<WriteOutcome, String> {
-    let json = serde_json::json!({ "interval_hours": interval_hours }).to_string();
-    elevate("--install-task", json)
-}
-
-/// 提权移除计划任务
-pub fn elevate_remove_task() -> Result<WriteOutcome, String> {
-    elevate("--remove-task", "{}".into())
-}

@@ -5,11 +5,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cfapi;
 mod config;
 mod hosts;
 mod logger;
 mod privilege;
-mod scheduler;
 mod selftest;
 mod speedtest;
 
@@ -23,8 +23,6 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str).unwrap_or("") {
         "--write-hosts" => helper_with_outcome(args.get(2), helper_write_hosts),
-        "--install-task" => helper_with_outcome(args.get(2), helper_install_task),
-        "--remove-task" => helper_with_outcome(args.get(2), helper_remove_task),
         "--auto" => run_auto(),
         "--selftest" => selftest::run(),
         _ => app::run_gui(),
@@ -106,6 +104,39 @@ fn run_auto() {
             log.info(d);
         }
         log.info(&outcome.message);
+
+        // Cloudflare DNS 动态发布(启用且已配置时):把最优 IP 更新为灰云 A 记录。
+        // 纯 HTTPS 调用,失败不影响 hosts 结果,只记录日志。
+        if cfg.cf_dns.enabled {
+            let token = cfg.cf_dns.api_token.trim().to_string();
+            let domain =
+                cfg.cf_dns.domain.trim().trim_end_matches('.').to_string();
+            if !token.is_empty() && !domain.is_empty() {
+                let zone = match &cfg.cf_dns.zone_id {
+                    Some(z) => Some(z.clone()),
+                    None => cfapi::resolve_zone(&token, &domain).ok(),
+                };
+                let dns = match zone {
+                    Some(z) => {
+                        let o = cfapi::upsert_record(&token, &z, &domain, &best.ip);
+                        // 缓存 zone_id 供下次使用
+                        if cfg.cf_dns.zone_id.as_deref() != Some(z.as_str()) {
+                            cfg.cf_dns.zone_id = Some(z);
+                        }
+                        o
+                    }
+                    None => WriteOutcome::fail("Cloudflare DNS 发布失败:定位 Zone 失败"),
+                };
+                if dns.ok {
+                    for d in &dns.diff {
+                        log.info(d);
+                    }
+                } else {
+                    log.error(&dns.message);
+                }
+            }
+        }
+
         cfg.last_run = LastRun {
             best_ip: Some(best.ip.clone()),
             best_latency_ms: Some(best.avg_latency_ms),
@@ -155,34 +186,4 @@ fn helper_write_hosts(job_path: Option<&String>) -> WriteOutcome {
     hosts::apply_job(&job)
 }
 
-fn helper_install_task(job_path: Option<&String>) -> WriteOutcome {
-    if !privilege::is_elevated() {
-        return WriteOutcome::fail("helper 未以管理员运行");
-    }
-    let payload: serde_json::Value = job_path
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::json!({ "interval_hours": 24 }));
-    let hours = payload
-        .get("interval_hours")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(24) as u32;
-    match scheduler::install(hours) {
-        Ok(()) => WriteOutcome {
-            ok: true,
-            message: format!("计划任务已注册(每 {hours} 小时,最高权限)"),
-            diff: vec![],
-        },
-        Err(e) => WriteOutcome::fail(e),
-    }
-}
 
-fn helper_remove_task(_job_path: Option<&String>) -> WriteOutcome {
-    if !privilege::is_elevated() {
-        return WriteOutcome::fail("helper 未以管理员运行");
-    }
-    match scheduler::remove() {
-        Ok(()) => WriteOutcome { ok: true, message: "计划任务已移除".into(), diff: vec![] },
-        Err(e) => WriteOutcome::fail(e),
-    }
-}

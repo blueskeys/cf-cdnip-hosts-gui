@@ -13,15 +13,22 @@ pub struct DomainEntry {
     pub pin_ip: Option<String>,
 }
 
+/// 内置定时器(程序运行期间生效,跨平台,不依赖系统计划任务)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ScheduleConfig {
     pub enabled: bool,
-    pub interval_hours: u32,
+    /// 触发间隔(分钟)
+    #[serde(default = "default_interval_minutes")]
+    pub interval_minutes: u32,
+}
+
+fn default_interval_minutes() -> u32 {
+    120
 }
 
 impl Default for ScheduleConfig {
     fn default() -> Self {
-        Self { enabled: false, interval_hours: 24 }
+        Self { enabled: false, interval_minutes: 120 }
     }
 }
 
@@ -70,6 +77,31 @@ pub struct LastRun {
     pub at: Option<String>,
 }
 
+/// Cloudflare DNS 动态发布:把当前最优 IP 更新到一条灰云 A 记录,
+/// 供外部工具/内网 DNS 通过普通 DNS 查询获取优选 IP。
+/// 默认全部留空:域名与 Token 属于用户私有信息,不进源码与默认配置。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CfDnsConfig {
+    pub enabled: bool,
+    /// Cloudflare API Token(建议仅授 Zone.DNS Edit 权限)
+    pub api_token: String,
+    /// 发布域名(如 vip.example.com);A 记录强制灰云(proxied=false)
+    pub domain: String,
+    /// zone_id 缓存(「验证连接」时自动填写,避免每次逐级查询)
+    pub zone_id: Option<String>,
+}
+
+impl Default for CfDnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_token: String::new(),
+            domain: String::new(),
+            zone_id: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     pub version: u32,
@@ -80,6 +112,9 @@ pub struct Config {
     /// UI 主题:深色(默认)/浅色
     #[serde(default = "default_dark_mode")]
     pub dark_mode: bool,
+    /// Cloudflare DNS 动态发布(默认关闭)
+    #[serde(default)]
+    pub cf_dns: CfDnsConfig,
 }
 
 fn default_dark_mode() -> bool {
@@ -96,6 +131,7 @@ impl Default for Config {
             speedtest: SpeedtestConfig::default(),
             last_run: LastRun::default(),
             dark_mode: true,
+            cf_dns: CfDnsConfig::default(),
         }
     }
 }

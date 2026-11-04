@@ -20,6 +20,18 @@ fn job_replace(entries: Vec<(&str, &str)>, meta: &str) -> WriteJob {
 pub fn checks() -> Vec<(&'static str, bool)> {
     let mut v: Vec<(&'static str, bool)> = Vec::new();
 
+    // --- 0. CF zone 候选序列:逐级去掉最左侧标签(曾因方向写反导致三级域名查不到 zone) ---
+    let cand = crate::cfapi::zone_candidates("a.b.example.com");
+    v.push((
+        "zone 候选序列(去最左标签)",
+        cand
+            == vec![
+                "a.b.example.com".to_string(),
+                "b.example.com".to_string(),
+                "example.com".to_string(),
+            ],
+    ));
+
     // --- 1. CSV 解析(UTF-8 BOM + 7 列 + -dd 5 列格式) ---
     let sample = "\u{feff}IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码\n\
                   172.67.69.143,4,4,0.00,91.63,23.23,HKG\n\

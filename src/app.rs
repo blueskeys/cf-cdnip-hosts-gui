@@ -104,7 +104,16 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 enum AppEvent {
     Speedtest(SpeedtestEvent),
     WriteDone(WriteOutcome),
-    TaskDone(WriteOutcome),
+    /// Cloudflare DNS 发布/验证完成;附带解析出的 zone_id(用于缓存)
+    CfDnsDone(WriteOutcome, Option<String>),
+}
+
+/// "%Y-%m-%d %H:%M" → 本地时区 DateTime(用于从 last_run.at 恢复定时器基准)
+fn parse_local_dt(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+        .ok()
+        .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
 }
 
 /// UI 收集的待执行动作(点击后在面板闭包外统一处理,避开借用冲突)
@@ -115,11 +124,23 @@ enum Act {
     AddDomain,
     RemoveDomain(usize),
     PinIp(usize, String),
+    /// 选定并写入 hosts,同时强制更新 Cloudflare DNS(不受 enabled 开关限制)
+    PinIpDns(usize, String),
     ClearPin(usize),
     SaveConfig,
-    InstallTask,
-    RemoveTask,
+    VerifyCfDns,
+    UpdateCfDns,
     ToggleTheme,
+}
+
+/// dispatch_write 的 DNS 发布模式
+enum DnsMode {
+    /// 不发布(还原操作)
+    Off,
+    /// 启用动态发布时才发布(常规绑定写入)
+    Auto,
+    /// 强制发布(行内「更新DNS」按钮,只需 Token/域名已配置)
+    Force,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -164,9 +185,11 @@ pub struct CfApp {
     status_msg: String,
     cfst_found: Option<String>,
     ip_found: Option<String>,
-    task_installed: bool,
-    /// 设置页的 cfst 路径编辑镜像(空 = 自动探测)
+    /// 内置定时器:上次自动执行时刻(chrono 本地时间,跨重启从 last_run.at 恢复)
+    last_auto_at: Option<chrono::DateTime<chrono::Local>>,    /// 设置页的 cfst 路径编辑镜像(空 = 自动探测)
     ui_cfst_path: String,
+    /// 设置页的 Cloudflare API Token 编辑镜像(密码框;空 = 未配置)
+    ui_cf_token: String,
     /// 测速结果页内嵌页签
     results_tab: ResultsTab,
     /// 空闲计时起点与工作集修剪标记(空闲内存优化)
@@ -183,7 +206,7 @@ impl CfApp {
         let cfst_found = speedtest::resolve_cfst(&cfg).map(|p| p.display().to_string());
         let ip_found = speedtest::resolve_ip_file(&cfg).map(|p| p.display().to_string());
         let ui_cfst_path = cfg.speedtest.cfst_path.clone().unwrap_or_default();
-        let task_installed = crate::scheduler::is_installed();
+        let ui_cf_token = cfg.cf_dns.api_token.clone();
 
         // 启动时从磁盘恢复上次测速结果(重启 GUI 不丢失,可直接「写入 hosts」)
         let mut restored = 0usize;
@@ -211,6 +234,8 @@ impl CfApp {
             }
         }
 
+        // 内置定时器:以上次成功运行时间为基准恢复周期(重启不重置)
+        let last_auto_at = cfg.last_run.at.as_deref().and_then(parse_local_dt);
         let mut app = Self {
             cfg,
             log: Logger::new(),
@@ -229,8 +254,9 @@ impl CfApp {
             status_msg: String::new(),
             cfst_found,
             ip_found,
-            task_installed,
+            last_auto_at,
             ui_cfst_path,
+            ui_cf_token,
             results_tab: ResultsTab::List,
             idle_since: Instant::now(),
             ws_trimmed: false,
@@ -333,9 +359,15 @@ impl CfApp {
                         format!("✗ {}", o.message)
                     };
                 }
-                AppEvent::TaskDone(o) => {
+                AppEvent::CfDnsDone(o, zone) => {
                     self.busy = None;
-                    self.task_installed = crate::scheduler::is_installed();
+                    // 缓存 zone_id,后续发布少 1-2 次 API 查询
+                    if let Some(z) = zone {
+                        if self.cfg.cf_dns.zone_id.as_deref() != Some(z.as_str()) {
+                            self.cfg.cf_dns.zone_id = Some(z);
+                            let _ = self.cfg.save();
+                        }
+                    }
                     if o.ok {
                         self.log.info(&o.message);
                     } else {
@@ -348,6 +380,27 @@ impl CfApp {
                     };
                 }
             }
+        }
+    }
+
+    /// 内置定时器:到点自动执行「测速 → 写 hosts → 发布 Cloudflare DNS」完整链路。
+    /// 程序运行期间生效,跨平台,不依赖系统计划任务;busy 时顺延到空闲。
+    fn maybe_auto_run(&mut self, ctx: &egui::Context) {
+        if !self.cfg.schedule.enabled || self.busy.is_some() || self.cfg.domains.is_empty() {
+            return;
+        }
+        let interval =
+            chrono::Duration::minutes(self.cfg.schedule.interval_minutes.max(1) as i64);
+        let due = match self.last_auto_at {
+            Some(t) => chrono::Local::now() - t >= interval,
+            None => true,
+        };
+        if due {
+            self.last_auto_at = Some(chrono::Local::now());
+            let next_min = self.cfg.schedule.interval_minutes;
+            self.log
+                .info(format!("内置定时器触发:自动测速并更新(每 {next_min} 分钟)"));
+            self.start_speedtest(ctx, true);
         }
     }
 
@@ -364,7 +417,7 @@ impl CfApp {
                 let job =
                     WriteJob { mode: WriteMode::RemoveAll, entries: vec![], meta: String::new() };
                 self.log.info("请求还原:移除管理区块");
-                self.dispatch_write(ctx, job, "还原 hosts");
+                self.dispatch_write(ctx, job, "还原 hosts", DnsMode::Off);
             }
             Act::ToggleTheme => {
                 self.cfg.dark_mode = !self.cfg.dark_mode;
@@ -412,8 +465,31 @@ impl CfApp {
                     entries: bindings(&self.cfg, &self.results),
                     meta: meta_line(&self.results[0]),
                 };
-                self.dispatch_write(ctx, job, "选定写入");
+                self.dispatch_write(ctx, job, "写入Hosts", DnsMode::Auto);
                 self.status_msg = "已选定 IP,正在写入 hosts…".into();
+                self.log.info(&self.status_msg);
+            }
+            Act::PinIpDns(i, ip) => {
+                let token = self.cfg.cf_dns.api_token.trim().to_string();
+                let domain =
+                    self.cfg.cf_dns.domain.trim().trim_end_matches('.').to_string();
+                if token.is_empty() || domain.is_empty() {
+                    self.status_msg =
+                        "「更新DNS」需先在设置中配置 Cloudflare Token 与发布域名".into();
+                    self.log.error(&self.status_msg);
+                    return;
+                }
+                if let Some(d) = self.cfg.domains.get_mut(i) {
+                    d.pin_ip = Some(ip);
+                }
+                let _ = self.cfg.save();
+                let job = WriteJob {
+                    mode: WriteMode::Replace,
+                    entries: bindings(&self.cfg, &self.results),
+                    meta: meta_line(&self.results[0]),
+                };
+                self.dispatch_write(ctx, job, "更新DNS", DnsMode::Force);
+                self.status_msg = "已选定 IP,写入 hosts 并更新 Cloudflare DNS…".into();
                 self.log.info(&self.status_msg);
             }
             Act::ClearPin(i) => {
@@ -430,7 +506,7 @@ impl CfApp {
                         entries: bindings(&self.cfg, &self.results),
                         meta: meta_line(&self.results[0]),
                     };
-                    self.dispatch_write(ctx, job, "清除选定");
+                    self.dispatch_write(ctx, job, "清除选定", DnsMode::Auto);
                     self.status_msg = "已恢复自动跟随第一名,正在写入 hosts…".into();
                     self.log.info(&self.status_msg);
                 }
@@ -438,6 +514,12 @@ impl CfApp {
             Act::SaveConfig => {
                 let p = self.ui_cfst_path.trim().to_string();
                 self.cfg.speedtest.cfst_path = if p.is_empty() { None } else { Some(p) };
+                let t = self.ui_cf_token.trim().to_string();
+                if self.cfg.cf_dns.api_token != t {
+                    self.cfg.cf_dns.api_token = t;
+                    // Token 变更后 zone 缓存可能失效,清空待重新验证
+                    self.cfg.cf_dns.zone_id = None;
+                }
                 let _ = self.cfg.save();
                 self.cfst_found =
                     speedtest::resolve_cfst(&self.cfg).map(|p| p.display().to_string());
@@ -446,48 +528,96 @@ impl CfApp {
                 self.status_msg = "设置已保存".into();
                 self.log.info("设置已保存");
             }
-            Act::InstallTask => {
+            Act::VerifyCfDns => {
                 if self.busy.is_some() {
                     return;
                 }
-                self.busy = Some("注册计划任务".into());
-                let hours = self.cfg.schedule.interval_hours;
+                // 点「验证连接」即同步保存 Token,避免填了没保存、重启后丢失
+                self.sync_cf_token();
+                let token = self.ui_cf_token.trim().to_string();
+                let domain =
+                    self.cfg.cf_dns.domain.trim().trim_end_matches('.').to_string();
+                if token.is_empty() || domain.is_empty() {
+                    self.status_msg = "请先填写 Cloudflare API Token 与发布域名".into();
+                    return;
+                }
+                self.busy = Some("验证 Cloudflare 连接".into());
                 let tx = self.tx.clone();
                 let ectx = ctx.clone();
-                let log = self.log.clone();
                 std::thread::spawn(move || {
-                    let outcome = privilege::elevate_install_task(hours)
-                        .unwrap_or_else(|e| WriteOutcome::fail(e));
-                    if outcome.ok {
-                        log.info(&outcome.message);
-                    } else {
-                        log.error(format!("注册计划任务失败: {}", outcome.message));
-                    }
-                    let _ = tx.send(AppEvent::TaskDone(outcome));
+                    let (zone, outcome) =
+                        match crate::cfapi::verify(&token)
+                            .and_then(|_| crate::cfapi::resolve_zone(&token, &domain))
+                        {
+                            Ok(z) => (
+                                Some(z),
+                                WriteOutcome {
+                                    ok: true,
+                                    message: "Cloudflare 连接正常:Token 有效,已定位发布域名所在 Zone"
+                                        .into(),
+                                    diff: vec![],
+                                },
+                            ),
+                            Err(e) => (None, WriteOutcome::fail(e)),
+                        };
+                    let _ = tx.send(AppEvent::CfDnsDone(outcome, zone));
                     ectx.request_repaint();
                 });
             }
-            Act::RemoveTask => {
+            Act::UpdateCfDns => {
                 if self.busy.is_some() {
                     return;
                 }
-                self.busy = Some("移除计划任务".into());
+                self.sync_cf_token();
+                let token = self.ui_cf_token.trim().to_string();
+                let domain =
+                    self.cfg.cf_dns.domain.trim().trim_end_matches('.').to_string();
+                if token.is_empty() || domain.is_empty() {
+                    self.status_msg = "请先填写 Cloudflare API Token 与发布域名".into();
+                    return;
+                }
+                let Some(best) = self.results.first().map(|r| r.ip.clone()) else {
+                    self.status_msg = "没有测速结果,请先测速".into();
+                    return;
+                };
+                self.busy = Some("更新 Cloudflare DNS".into());
+                let zone_cached = self.cfg.cf_dns.zone_id.clone();
                 let tx = self.tx.clone();
                 let ectx = ctx.clone();
-                let log = self.log.clone();
                 std::thread::spawn(move || {
-                    let outcome = privilege::elevate_remove_task()
-                        .unwrap_or_else(|e| WriteOutcome::fail(e));
-                    if outcome.ok {
-                        log.info(&outcome.message);
-                    } else {
-                        log.error(format!("移除计划任务失败: {}", outcome.message));
-                    }
-                    let _ = tx.send(AppEvent::TaskDone(outcome));
+                    let (zone, outcome) = match zone_cached {
+                        Some(z) => {
+                            let d = crate::cfapi::upsert_record(&token, &z, &domain, &best);
+                            (Some(z), d)
+                        }
+                        None => match crate::cfapi::resolve_zone(&token, &domain) {
+                            Ok(z) => {
+                                let d = crate::cfapi::upsert_record(&token, &z, &domain, &best);
+                                (Some(z), d)
+                            }
+                            Err(e) => (
+                                None,
+                                WriteOutcome::fail(format!(
+                                    "Cloudflare DNS 更新失败:定位 Zone 失败:{e}"
+                                )),
+                            ),
+                        },
+                    };
+                    let _ = tx.send(AppEvent::CfDnsDone(outcome, zone));
                     ectx.request_repaint();
                 });
             }
         }
+    }
+
+    /// 把设置页 Token 输入框的值同步回配置并落盘(值有变时清空 zone 缓存)
+    fn sync_cf_token(&mut self) {
+        let t = self.ui_cf_token.trim().to_string();
+        if self.cfg.cf_dns.api_token != t {
+            self.cfg.cf_dns.api_token = t;
+            self.cfg.cf_dns.zone_id = None;
+        }
+        let _ = self.cfg.save();
     }
 
     fn start_speedtest(&mut self, ctx: &egui::Context, auto_apply: bool) {
@@ -530,11 +660,40 @@ impl CfApp {
             entries: bindings(&self.cfg, &self.results),
             meta: meta_line(&self.results[0]),
         };
-        self.dispatch_write(ctx, job, "写入 hosts");
+        self.dispatch_write(ctx, job, "写入 hosts", DnsMode::Auto);
     }
 
-    fn dispatch_write(&mut self, ctx: &egui::Context, job: WriteJob, label: &str) {
+    /// `dns_mode`:hosts 写入成功后是否顺带把最优 IP 发布到 Cloudflare DNS
+    /// (还原传 Off;常规绑定写入传 Auto,受「启用动态发布」开关控制;
+    ///  行内「更新DNS」传 Force,只要 Token/域名已配置就发布)
+    fn dispatch_write(
+        &mut self,
+        ctx: &egui::Context,
+        job: WriteJob,
+        label: &str,
+        dns_mode: DnsMode,
+    ) {
         self.busy = Some(label.to_string());
+        let want_dns = match dns_mode {
+            DnsMode::Off => false,
+            DnsMode::Auto => self.cfg.cf_dns.enabled,
+            DnsMode::Force => true,
+        };
+        // DNS 发布任务快照(跨线程只读;未启用或未配置则为 None)
+        let cf_job: Option<(String, String, Option<String>, String)> = if want_dns {
+                let c = &self.cfg.cf_dns;
+                let token = c.api_token.trim().to_string();
+                let domain = c.domain.trim().trim_end_matches('.').to_string();
+                if token.is_empty() || domain.is_empty() {
+                    None
+                } else {
+                    self.results
+                        .first()
+                        .map(|r| (token, domain, c.zone_id.clone(), r.ip.clone()))
+                }
+            } else {
+                None
+            };
         let tx = self.tx.clone();
         let ectx = ctx.clone();
         let log = self.log.clone();
@@ -552,8 +711,41 @@ impl CfApp {
             } else {
                 log.error(format!("hosts 写入失败: {}", outcome.message));
             }
-            let _ = tx.send(AppEvent::WriteDone(outcome));
+            let _ = tx.send(AppEvent::WriteDone(outcome.clone()));
             ectx.request_repaint();
+
+            // hosts 成功后,把当前最优 IP 发布为灰云 A 记录(供外部 dig 查询)
+            if outcome.ok {
+                if let Some((token, domain, zone_id, ip)) = cf_job {
+                    let (zone, dns) = match zone_id {
+                        Some(z) => {
+                            let d = crate::cfapi::upsert_record(&token, &z, &domain, &ip);
+                            (Some(z), d)
+                        }
+                        None => match crate::cfapi::resolve_zone(&token, &domain) {
+                            Ok(z) => {
+                                let d = crate::cfapi::upsert_record(&token, &z, &domain, &ip);
+                                (Some(z), d)
+                            }
+                            Err(e) => (
+                                None,
+                                WriteOutcome::fail(format!(
+                                    "Cloudflare DNS 发布失败:定位 Zone 失败:{e}"
+                                )),
+                            ),
+                        },
+                    };
+                    if dns.ok {
+                        for d in &dns.diff {
+                            log.info(d);
+                        }
+                    } else {
+                        log.error(&dns.message);
+                    }
+                    let _ = tx.send(AppEvent::CfDnsDone(dns, zone));
+                    ectx.request_repaint();
+                }
+            }
         });
     }
 
@@ -579,6 +771,9 @@ impl CfApp {
         for a in acts {
             self.handle(ctx, a);
         }
+        // 内置定时器:检查是否到点(用户操作优先生效,忙时顺延)
+        self.maybe_auto_run(ctx);
+
         if self.busy.is_some() {
             self.idle_since = Instant::now();
             self.ws_trimmed = false;
@@ -594,6 +789,17 @@ impl CfApp {
                 let left = 10 - self.idle_since.elapsed().as_secs();
                 ctx.request_repaint_after(std::time::Duration::from_secs(left + 1));
             }
+        }
+
+        // 内置定时器启用时:预约一帧在到点时刻醒来(空闲下 update 不会被调)
+        if self.cfg.schedule.enabled && self.busy.is_none() {
+            let interval_secs = 60u64 * self.cfg.schedule.interval_minutes.max(1) as u64;
+            let elapsed = self
+                .last_auto_at
+                .map(|t| (chrono::Local::now() - t).num_seconds().max(0) as u64)
+                .unwrap_or(0);
+            let remaining = interval_secs.saturating_sub(elapsed);
+            ctx.request_repaint_after(std::time::Duration::from_secs(remaining + 1));
         }
     }
 
@@ -630,39 +836,6 @@ impl CfApp {
                     ui.label(RichText::new(format!("上次更新 {at}")).small().color(p.muted_fg));
                 }
             });
-        });
-        ui.add_space(4.0);
-        // 第二行:每个域名的生效状态胶囊
-        ui.horizontal(|ui| {
-            let items: Vec<(String, Option<String>, Option<String>)> = self
-                .hosts_effective
-                .iter()
-                .map(|(dom, eff)| {
-                    let expected = self
-                        .cfg
-                        .domains
-                        .iter()
-                        .find(|d| &d.name == dom)
-                        .and_then(|d| d.pin_ip.clone())
-                        .or_else(|| self.cfg.last_run.best_ip.clone());
-                    (dom.clone(), eff.clone(), expected)
-                })
-                .collect();
-            for (dom, eff, expected) in items {
-                let (txt, color, tip): (String, Color32, &str) = match (&eff, &expected) {
-                    (Some(e), Some(x)) if e == x => {
-                        (format!("{dom}（{e}）"), p.ok, "hosts 已指向期望 IP,优选生效中")
-                    }
-                    (Some(e), _) => (
-                        format!("{dom}（{e}）"),
-                        p.warn,
-                        "hosts 指向与期望不一致;点上方「把结果写入 hosts」更新",
-                    ),
-                    _ => (format!("{dom} 未写入"), p.muted_fg, "尚未写入 hosts;测速并写入后生效"),
-                };
-                chip(ui, &txt, color, tip);
-                ui.add_space(4.0);
-            }
         });
         ui.add_space(4.0);
     }
@@ -734,7 +907,18 @@ impl CfApp {
                     ui.label(RichText::new(format!("{b} · {}{el}", self.stage)).small().strong());
                 } else if !self.status_msg.is_empty() {
                     let color = if self.status_msg.starts_with('✗') { p.err } else { p.muted_fg };
-                    ui.label(RichText::new(&self.status_msg).small().color(color));
+                    // 状态栏空间有限:超长截断(完整内容悬停可见/查日志)
+                    let shown: String = if self.status_msg.chars().count() > 48 {
+                        let s: String = self.status_msg.chars().take(48).collect();
+                        format!("{s}…")
+                    } else {
+                        self.status_msg.clone()
+                    };
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(shown).small().color(color))
+                            .sense(egui::Sense::hover()),
+                    );
+                    resp.on_hover_text(self.status_msg.clone());
                 }
             });
         });
@@ -895,7 +1079,7 @@ impl CfApp {
                 return;
             }
 
-            table(ui, &[130.0, 130.0, 100.0, 130.0])
+            table(ui, &[130.0, 130.0, 100.0, 160.0])
             .header(28.0, |mut header| {
                 header.col(|ui| table_head(ui, p, "域名"));
                 header.col(|ui| table_head(ui, p, "选定 IP"));
@@ -1056,7 +1240,7 @@ impl CfApp {
         // 绑定目标选择(与说明放在一起)
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("行内「选定写入」把该 IP 绑定并立即写入:");
+                ui.label("「写入Hosts」绑定:");
                 let names: Vec<String> =
                     self.cfg.domains.iter().map(|d| d.name.clone()).collect();
                 if names.is_empty() {
@@ -1065,13 +1249,22 @@ impl CfApp {
                     let mut idx = self.bind_target.min(names.len() - 1);
                     egui::ComboBox::from_id_source("bind_target")
                         .selected_text(names[idx].clone())
-                        .width(220.0)
+                        .width(200.0)
                         .show_ui(ui, |ui| {
                             for (i, n) in names.iter().enumerate() {
                                 ui.selectable_value(&mut idx, i, n);
                             }
                         });
                     self.bind_target = idx;
+                }
+                ui.separator();
+                let vip = self.cfg.cf_dns.domain.trim();
+                if vip.is_empty() {
+                    ui.label(RichText::new("「更新DNS」发布:(未配置,见设置)").small().weak());
+                } else {
+                    ui.label(
+                        RichText::new(format!("「更新DNS」发布:{vip}")).small().color(p.ok),
+                    );
                 }
             });
         });
@@ -1085,7 +1278,7 @@ impl CfApp {
         let dim_zero_speed = !self.cfg.speedtest.disable_download;
 
         card(ui, |ui| {
-            table(ui, &[80.0, 70.0, 100.0, 60.0, 90.0])
+            table(ui, &[76.0, 64.0, 92.0, 56.0, 224.0])
             .header(28.0, |mut header| {
                 header.col(|ui| table_head(ui, p, "IP"));
                 header.col(|ui| table_head(ui, p, "延迟 ms"));
@@ -1141,18 +1334,47 @@ impl CfApp {
                             ui.label(maybe_dim(&t, dim));
                         });
                         row.col(|ui| {
-                            let (label, style, tip) = if is_pinned {
-                                ("取消选定", BtnStyle::OkSoft, "取消选定,恢复自动跟随第一名并立即写入 hosts")
-                            } else {
-                                ("选定写入", BtnStyle::Ghost, "把该 IP 绑定到上方选中的域名并立即写入 hosts")
-                            };
-                            if styled_button(ui, label, None, style, BtnSize::Small, true, tip)
+                            if is_pinned {
+                                if styled_button(
+                                    ui,
+                                    "取消选定",
+                                    None,
+                                    BtnStyle::OkSoft,
+                                    BtnSize::Small,
+                                    true,
+                                    "取消选定,恢复自动跟随第一名并立即写入 hosts",
+                                )
                                 .clicked()
-                            {
-                                if is_pinned {
+                                {
                                     acts.push(Act::ClearPin(target));
-                                } else {
+                                }
+                            } else {
+                                if styled_button(
+                                    ui,
+                                    "写入Hosts",
+                                    None,
+                                    BtnStyle::Ghost,
+                                    BtnSize::Small,
+                                    true,
+                                    "把该 IP 绑定到上方选中的域名并立即写入 hosts",
+                                )
+                                .clicked()
+                                {
                                     acts.push(Act::PinIp(target, r.ip.clone()));
+                                }
+                                ui.add_space(4.0);
+                                if styled_button(
+                                    ui,
+                                    "更新DNS",
+                                    None,
+                                    BtnStyle::Ghost,
+                                    BtnSize::Small,
+                                    true,
+                                    "绑定该 IP + 写入 hosts + 立即发布到 Cloudflare DNS(灰云 A 记录)",
+                                )
+                                .clicked()
+                                {
+                                    acts.push(Act::PinIpDns(target, r.ip.clone()));
                                 }
                             }
                         });
@@ -1168,6 +1390,11 @@ impl CfApp {
         let p = pal(ui);
         page_header(ui, "设置", "SETTINGS", "");
 
+        // 设置项较多:卡片整体放进垂直滚动区,「保存设置」固定在底部
+        egui::ScrollArea::vertical()
+            .id_source("settings_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         card(ui, |ui| {
             ui.label(RichText::new("测速引擎").strong());
             ui.add_space(4.0);
@@ -1264,62 +1491,136 @@ impl CfApp {
         ui.add_space(8.0);
 
         card(ui, |ui| {
-            ui.label(RichText::new("定时自动更新").strong());
+            ui.label(RichText::new("Cloudflare DNS 动态发布").strong());
+            ui.add_space(4.0);
+            egui::Grid::new("cf_dns")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("启用动态发布:");
+                    ui.checkbox(&mut self.cfg.cf_dns.enabled, "");
+                    ui.end_row();
+
+                    ui.label("API Token:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ui_cf_token)
+                            .password(true)
+                            .desired_width(380.0)
+                            .hint_text("Cloudflare API Token(建议仅授 Zone.DNS Edit 权限)"),
+                    );
+                    ui.end_row();
+
+                    ui.label("发布域名:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cfg.cf_dns.domain)
+                            .desired_width(380.0)
+                            .hint_text("如 vip.example.com"),
+                    );
+                    ui.end_row();
+
+                    ui.label("连接状态:");
+                    ui.horizontal(|ui| {
+                        if self.cfg.cf_dns.zone_id.is_some() {
+                            ui.label(RichText::new("已验证(Zone 已缓存)").color(p.ok));
+                        } else {
+                            ui.label(RichText::new("未验证").weak());
+                        }
+                        if styled_button(
+                            ui,
+                            "验证连接",
+                            None,
+                            BtnStyle::Ghost,
+                            BtnSize::Normal,
+                            true,
+                            "校验 Token 有效性并定位发布域名所在 Zone",
+                        )
+                        .clicked()
+                        {
+                            acts.push(Act::VerifyCfDns);
+                        }
+                        ui.add_space(6.0);
+                        if styled_button(
+                            ui,
+                            "更新 DNS",
+                            None,
+                            BtnStyle::Ghost,
+                            BtnSize::Normal,
+                            true,
+                            "立即把当前最优 IP 发布为发布域名的灰云 A 记录",
+                        )
+                        .clicked()
+                        {
+                            acts.push(Act::UpdateCfDns);
+                        }
+                    });
+                    ui.end_row();
+                });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "写入 hosts 成功后,自动把当前最优 IP 更新为发布域名的灰云 A 记录\
+                     (TTL 60,强制不开 Cloudflare 代理);外部工具 dig 该域名即可获得当前优选 IP。\
+                     Token 明文保存于本机配置文件。",
+                )
+                .small()
+                .color(p.muted_fg),
+            );
+        });
+        ui.add_space(8.0);
+
+        card(ui, |ui| {
+            ui.label(RichText::new("自动更新(内置定时器)").strong());
             ui.add_space(4.0);
             egui::Grid::new("sched")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("启用定时自动更新:");
+                    ui.label("启用自动更新:");
                     ui.checkbox(&mut self.cfg.schedule.enabled, "");
                     ui.end_row();
 
-                    ui.label("间隔(小时):");
+                    ui.label("间隔(分钟):");
                     ui.add(
-                        egui::DragValue::new(&mut self.cfg.schedule.interval_hours)
-                            .clamp_range(1..=720)
-                            .suffix(" h"),
+                        egui::DragValue::new(&mut self.cfg.schedule.interval_minutes)
+                            .clamp_range(10..=10080)
+                            .speed(5)
+                            .suffix(" min"),
                     );
                     ui.end_row();
 
-                    ui.label("计划任务状态:");
-                    if self.task_installed {
-                        ui.label(RichText::new("已注册(最高权限运行 --auto)").color(p.ok));
+                    ui.label("下次自动更新:");
+                    if self.cfg.schedule.enabled {
+                        match self.last_auto_at {
+                            Some(t) => {
+                                let next = t
+                                    + chrono::Duration::minutes(
+                                        self.cfg.schedule.interval_minutes.max(1) as i64,
+                                    );
+                                ui.label(
+                                    RichText::new(next.format("%H:%M").to_string()).color(p.ok),
+                                );
+                            }
+                            None => {
+                                ui.label(RichText::new("即将执行").color(p.ok));
+                            }
+                        }
                     } else {
-                        ui.label(RichText::new("未注册").weak());
+                        ui.label(RichText::new("未启用").weak());
                     }
                     ui.end_row();
                 });
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if styled_button(
-                    ui,
-                    "注册计划任务",
-                    None,
-                    BtnStyle::Ghost,
-                    BtnSize::Normal,
-                    true,
-                    "注册 Windows 计划任务,最高权限定时运行 --auto(需 UAC)",
+            ui.label(
+                RichText::new(
+                    "到点自动执行:测速 → 写入 hosts → 更新 Cloudflare DNS(与「一键测速并更新」\
+                     相同链路)。定时器内置于程序,跨平台、无需注册系统计划任务,但需保持本程序运行;\
+                     到点时若正忙则顺延至空闲。写入 hosts 需要权限,未以管理员运行时会弹 UAC。",
                 )
-                .clicked()
-                {
-                    acts.push(Act::InstallTask);
-                }
-                ui.add_space(6.0);
-                if styled_button(ui, "移除计划任务", None, BtnStyle::Danger, BtnSize::Normal, true, "")
-                    .clicked()
-                {
-                    acts.push(Act::RemoveTask);
-                }
-                ui.label(
-                    RichText::new(
-                        "注册后每隔设定时间自动:测速 → 更新 hosts → 写日志 → 退出,全程无弹窗",
-                    )
-                    .small()
-                    .color(p.muted_fg),
-                );
-            });
+                .small()
+                .color(p.muted_fg),
+            );
         });
+            });
         ui.add_space(10.0);
         if styled_button(ui, "保存设置", None, BtnStyle::Primary, BtnSize::Normal, true, "")
             .clicked()
@@ -1457,21 +1758,7 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// 状态胶囊:token 色 12% 底 + token 色文字
-fn chip(ui: &mut egui::Ui, text: &str, color: Color32, tip: &str) {
-    let p = pal(ui);
-    let bg = mix(p.card, color, 0.16);
-    let frame = egui::Frame::default()
-        .fill(bg)
-        .stroke(egui::Stroke::new(1.0_f32, mix(p.card, color, 0.35)))
-        .rounding(egui::Rounding::same(999.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0));
-    let resp = frame
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).small().color(color));
-        })
-        .response;
-    resp.on_hover_text(tip);
-}
+
 
 fn page_header(ui: &mut egui::Ui, title: &str, tag: &str, sub: &str) {
     let p = pal(ui);

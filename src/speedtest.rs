@@ -447,10 +447,14 @@ mod tests {
     /// 输出走 CFHOSTS_RESULT_CSV 沙箱,绝不动用户真实 result.csv
     #[test]
     fn real_speedtest_emits_progress_events() {
-        // 本机开发环境才跑真 cfst;CI/其他机器无该路径时跳过(只跑纯解析测试)
-        let cfst = r"E:\workspace\ai-workspace\cloudfare-ip\cfst_windows_amd64\cfst.exe";
-        if !std::path::Path::new(cfst).is_file() {
-            eprintln!("跳过:未找到本机 cfst.exe({cfst})");
+        // 本机开发环境才跑真 cfst:复用 resolve_cfst 的相对路径探测
+        // (exe/bin → exe → cwd/bin → cwd → 各级祖先下的 cfst_windows_amd64/);
+        // 探测不到(CI/其他机器)时跳过,只跑纯解析测试
+        let cfst = resolve_cfst(&Config::default())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if cfst.is_empty() {
+            eprintln!("跳过:未探测到本机 cfst.exe(resolve_cfst 相对路径候选均未命中)");
             return;
         }
         let sandbox_csv = std::env::temp_dir().join("cfhost-gui-test-result.csv");
