@@ -57,8 +57,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if [ -n "${{ matrix.target }}" ]; then
-            # arm64 交叉编译:multiarch 装链接期所需的 arm64 wayland/xkbcommon(来自 ports 仓库)
+            # arm64 交叉编译:multiarch 装链接期所需的 arm64 wayland/xkbcommon(来自 ports 仓库)。
+            # 先把既有源限制为 amd64,否则 apt 会去 amd64 镜像抓 arm64 索引而 404(update 退出码 100)
             sudo dpkg --add-architecture arm64
+            sudo sed -i 's|^deb |deb [arch=amd64] |' /etc/apt/sources.list
             echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main universe" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
             sudo apt-get update
             sudo apt-get install -y gcc-aarch64-linux-gnu libwayland-dev:arm64 libxkbcommon-dev:arm64
