@@ -106,6 +106,20 @@ enum AppEvent {
     WriteDone(WriteOutcome),
     /// Cloudflare DNS 发布/验证完成;附带解析出的 zone_id(用于缓存)
     CfDnsDone(WriteOutcome, Option<String>),
+    /// 当前 A 记录查询完成(Ok(None) = 记录不存在)
+    CfRecordFetched(Result<Option<crate::cfapi::CfRecord>, String>),
+}
+
+/// 设置页「当前记录」行的展示状态
+enum CfRecordView {
+    /// 未查询过(启动初始态)
+    Unknown,
+    /// 查询成功但记录不存在
+    Missing,
+    /// 查询成功:Cloudflare 侧现值
+    Live(crate::cfapi::CfRecord),
+    /// 查询失败(Token 过期/网络等)
+    Failed(String),
 }
 
 /// "%Y-%m-%d %H:%M" → 本地时区 DateTime(用于从 last_run.at 恢复定时器基准)
@@ -130,6 +144,8 @@ enum Act {
     SaveConfig,
     VerifyCfDns,
     UpdateCfDns,
+    /// 查询发布域名当前 A 记录(设置页「查看记录」)
+    FetchCfRecord,
     ToggleTheme,
 }
 
@@ -190,6 +206,8 @@ pub struct CfApp {
     ui_cfst_path: String,
     /// 设置页的 Cloudflare API Token 编辑镜像(密码框;空 = 未配置)
     ui_cf_token: String,
+    /// 设置页「当前记录」行:Cloudflare 侧 A 记录现值回显
+    cf_record: CfRecordView,
     /// 测速结果页内嵌页签
     results_tab: ResultsTab,
     /// 空闲计时起点与工作集修剪标记(空闲内存优化)
@@ -257,6 +275,7 @@ impl CfApp {
             last_auto_at,
             ui_cfst_path,
             ui_cf_token,
+            cf_record: CfRecordView::Unknown,
             results_tab: ResultsTab::List,
             idle_since: Instant::now(),
             ws_trimmed: false,
@@ -370,6 +389,8 @@ impl CfApp {
                     }
                     if o.ok {
                         self.log.info(&o.message);
+                        // 发布/验证成功后回查一次,「当前记录」行保持与 Cloudflare 一致
+                        self.fetch_cf_record_async(ctx);
                     } else {
                         self.log.error(&o.message);
                     }
@@ -379,6 +400,16 @@ impl CfApp {
                         format!("✗ {}", o.message)
                     };
                 }
+                AppEvent::CfRecordFetched(r) => match r {
+                    Ok(rec) => {
+                        self.cf_record =
+                            if let Some(rec) = rec { CfRecordView::Live(rec) } else { CfRecordView::Missing };
+                    }
+                    Err(e) => {
+                        self.cf_record = CfRecordView::Failed(e.clone());
+                        self.status_msg = format!("✗ 查询记录失败:{e}");
+                    }
+                },
             }
         }
     }
@@ -418,6 +449,14 @@ impl CfApp {
                     WriteJob { mode: WriteMode::RemoveAll, entries: vec![], meta: String::new() };
                 self.log.info("请求还原:移除管理区块");
                 self.dispatch_write(ctx, job, "还原 hosts", DnsMode::Off);
+            }
+            Act::FetchCfRecord => {
+                self.sync_cf_token();
+                if self.cfg.cf_dns.zone_id.is_none() {
+                    self.status_msg = "请先「验证连接」定位 Zone".into();
+                    return;
+                }
+                self.fetch_cf_record_async(ctx);
             }
             Act::ToggleTheme => {
                 self.cfg.dark_mode = !self.cfg.dark_mode;
@@ -620,6 +659,23 @@ impl CfApp {
         let _ = self.cfg.save();
     }
 
+    /// 后台只读查询发布域名当前 A 记录(不占 busy 闸门,结果经 CfRecordFetched 回流)
+    fn fetch_cf_record_async(&self, ctx: &egui::Context) {
+        let token = self.cfg.cf_dns.api_token.trim().to_string();
+        let domain = self.cfg.cf_dns.domain.trim().trim_end_matches('.').to_string();
+        let Some(zone) = self.cfg.cf_dns.zone_id.clone() else { return };
+        if token.is_empty() || domain.is_empty() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let ectx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = crate::cfapi::fetch_record(&token, &zone, &domain);
+            let _ = tx.send(AppEvent::CfRecordFetched(r));
+            ectx.request_repaint();
+        });
+    }
+
     fn start_speedtest(&mut self, ctx: &egui::Context, auto_apply: bool) {
         if self.busy.is_some() {
             return;
@@ -755,24 +811,50 @@ impl CfApp {
         self.pump_events(ctx);
         let mut acts: Vec<Act> = Vec::new();
 
-        egui::TopBottomPanel::top("overview").show(ctx, |ui| self.ui_overview(ui));
-        egui::TopBottomPanel::top("actions").show(ctx, |ui| self.ui_actions(ui, &mut acts));
-        egui::SidePanel::left("nav")
-            .resizable(false)
-            .default_width(148.0)
-            .show(ctx, |ui| self.ui_nav(ui, &mut acts));
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Domains => self.ui_domains(ui, &mut acts),
-            Tab::Results => self.ui_results(ui, &mut acts),
-            Tab::Settings => self.ui_settings(ui, &mut acts),
-            Tab::Logs => self.ui_logs(ui),
-        });
+        // 隐藏到托盘期间:不构建 UI(窗口隐藏时无 vsync,Spinner/进度条等动画
+        // 控件会请求无限帧率重绘,把 CPU 打满);后台逻辑(事件泵/定时器)照常跑。
+        #[cfg(windows)]
+        let tray_hidden = {
+            // 仍收到输入事件说明窗口实际可见:兜底清标志,防状态失步后界面空白
+            let got_input = ctx.input(|i| !i.events.is_empty());
+            if got_input {
+                crate::tray::HIDDEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            crate::tray::HIDDEN.load(std::sync::atomic::Ordering::SeqCst) && !got_input
+        };
+        #[cfg(not(windows))]
+        let tray_hidden = false;
+
+        if !tray_hidden {
+            egui::TopBottomPanel::top("overview").show(ctx, |ui| self.ui_overview(ui));
+            egui::TopBottomPanel::top("actions").show(ctx, |ui| self.ui_actions(ui, &mut acts));
+            egui::SidePanel::left("nav")
+                .resizable(false)
+                .default_width(148.0)
+                .show(ctx, |ui| self.ui_nav(ui, &mut acts));
+            egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+                Tab::Domains => self.ui_domains(ui, &mut acts),
+                Tab::Results => self.ui_results(ui, &mut acts),
+                Tab::Settings => self.ui_settings(ui, &mut acts),
+                Tab::Logs => self.ui_logs(ui),
+            });
+        }
+        // 隐藏期间按固定节奏醒着即可(线程事件会另行唤醒)
+        else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
 
         for a in acts {
             self.handle(ctx, a);
         }
         // 内置定时器:检查是否到点(用户操作优先生效,忙时顺延)
         self.maybe_auto_run(ctx);
+
+        // 关窗被 tray 子类化 WndProc 拦截并隐藏到托盘;这里只负责记录一次日志
+        #[cfg(windows)]
+        if crate::tray::HIDDEN_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.log.info("已最小化到托盘,后台继续定时更新;托盘左键/菜单可打开,右键菜单可退出");
+        }
 
         if self.busy.is_some() {
             self.idle_since = Instant::now();
@@ -1261,6 +1343,12 @@ impl CfApp {
                 let vip = self.cfg.cf_dns.domain.trim();
                 if vip.is_empty() {
                     ui.label(RichText::new("「更新DNS」发布:(未配置,见设置)").small().weak());
+                } else if let CfRecordView::Live(r) = &self.cf_record {
+                    ui.label(
+                        RichText::new(format!("「更新DNS」发布:{vip} → {}", r.ip))
+                            .small()
+                            .color(p.ok),
+                    );
                 } else {
                     ui.label(
                         RichText::new(format!("「更新DNS」发布:{vip}")).small().color(p.ok),
@@ -1554,6 +1642,55 @@ impl CfApp {
                         }
                     });
                     ui.end_row();
+
+                    ui.label("当前记录:");
+                    ui.horizontal(|ui| {
+                        let can_query =
+                            self.cfg.cf_dns.zone_id.is_some() && !self.cfg.cf_dns.domain.trim().is_empty();
+                        match &self.cf_record {
+                            CfRecordView::Unknown => {
+                                ui.label(RichText::new("未查询").weak());
+                            }
+                            CfRecordView::Missing => {
+                                ui.label(RichText::new("无 A 记录(尚未创建)").color(p.warn));
+                            }
+                            CfRecordView::Live(r) => {
+                                // 橙云意味着 A 值不对外生效,提醒回灰云
+                                let (cloud, color) =
+                                    if r.proxied { ("橙云", p.warn) } else { ("灰云", p.ok) };
+                                ui.label(
+                                    RichText::new(r.ip.as_str()).monospace().strong().color(color),
+                                );
+                                ui.label(RichText::new(cloud).small().color(color));
+                                if !r.updated.is_empty() {
+                                    ui.label(
+                                        RichText::new(format!("· {} 更新", r.updated))
+                                            .small()
+                                            .color(p.muted_fg),
+                                    );
+                                }
+                            }
+                            CfRecordView::Failed(e) => {
+                                let msg: String = e.chars().take(30).collect();
+                                ui.label(RichText::new(format!("查询失败:{msg}")).color(p.err));
+                            }
+                        }
+                        ui.add_space(6.0);
+                        if styled_button(
+                            ui,
+                            "查看记录",
+                            None,
+                            BtnStyle::Ghost,
+                            BtnSize::Normal,
+                            can_query,
+                            "查询发布域名在 Cloudflare 上的当前 A 记录",
+                        )
+                        .clicked()
+                        {
+                            acts.push(Act::FetchCfRecord);
+                        }
+                    });
+                    ui.end_row();
                 });
             ui.add_space(4.0);
             ui.label(
@@ -1588,6 +1725,23 @@ impl CfApp {
                     );
                     ui.end_row();
 
+                    ui.label("上次更新:");
+                    match self.cfg.last_run.at.as_deref().and_then(parse_local_dt) {
+                        Some(t) => {
+                            // 当天只显时刻,跨天补日期
+                            let f = if t.date_naive() == chrono::Local::now().date_naive() {
+                                "%H:%M"
+                            } else {
+                                "%m-%d %H:%M"
+                            };
+                            ui.label(RichText::new(t.format(f).to_string()).color(p.muted_fg));
+                        }
+                        None => {
+                            ui.label(RichText::new("—").weak());
+                        }
+                    }
+                    ui.end_row();
+
                     ui.label("下次自动更新:");
                     if self.cfg.schedule.enabled {
                         match self.last_auto_at {
@@ -1596,9 +1750,13 @@ impl CfApp {
                                     + chrono::Duration::minutes(
                                         self.cfg.schedule.interval_minutes.max(1) as i64,
                                     );
-                                ui.label(
-                                    RichText::new(next.format("%H:%M").to_string()).color(p.ok),
-                                );
+                                // 间隔可设到 7 天:跨天时只显 HH:MM 会误导读
+                                let f = if next.date_naive() == chrono::Local::now().date_naive() {
+                                    "%H:%M"
+                                } else {
+                                    "%m-%d %H:%M"
+                                };
+                                ui.label(RichText::new(next.format(f).to_string()).color(p.ok));
                             }
                             None => {
                                 ui.label(RichText::new("即将执行").color(p.ok));
@@ -2154,6 +2312,12 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 // ---------- 窗口图标(绿色圆角方块 + 白色闪电,与品牌图形一致) ----------
 
 fn window_icon() -> Option<egui::IconData> {
+    let rgba = icon_rgba_64();
+    Some(egui::IconData { rgba, width: 64, height: 64 })
+}
+
+/// 64x64 程序图标 RGBA(窗口图标与托盘图标共用同一绘制)
+pub fn icon_rgba_64() -> Vec<u8> {
     let s = 64i32;
     let mut rgba = vec![0u8; (s * s * 4) as usize];
     let in_round_rect = |x: f32, y: f32| -> bool {
@@ -2209,7 +2373,7 @@ fn window_icon() -> Option<egui::IconData> {
             rgba[i + 3] = a;
         }
     }
-    Some(egui::IconData { rgba, width: s as u32, height: s as u32 })
+    rgba
 }
 
 // ---------- CJK 字体(egui 默认字体无中文;优先用体积小的黑体省内存) ----------
@@ -2289,6 +2453,10 @@ pub fn run_gui() {
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
             apply_visuals(&cc.egui_ctx, dark);
+            #[cfg(windows)]
+            if let Err(e) = crate::tray::init(&cc.egui_ctx) {
+                eprintln!("托盘初始化失败:{e}");
+            }
             Box::new(CfApp::new())
         }),
     )

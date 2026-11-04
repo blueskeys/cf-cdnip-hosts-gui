@@ -115,6 +115,33 @@ pub fn resolve_zone(token: &str, domain: &str) -> Result<String, String> {
     ))
 }
 
+/// 发布域名当前 A 记录的回显(设置页「当前记录」行)
+pub struct CfRecord {
+    pub ip: String,
+    pub proxied: bool,
+    /// 最后修改时间(已转本地时区,格式 "MM-DD HH:MM";拿不到则空)
+    pub updated: String,
+}
+
+/// 查询 domain 当前的 A 记录;Ok(None) = 记录不存在(尚未创建)
+pub fn fetch_record(token: &str, zone_id: &str, domain: &str) -> Result<Option<CfRecord>, String> {
+    let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let list = get(token, &format!("/zones/{zone_id}/dns_records?type=A&name={d}"))?;
+    Ok(list
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .map(|rec| CfRecord {
+            ip: rec["content"].as_str().unwrap_or("?").to_string(),
+            proxied: rec["proxied"].as_bool().unwrap_or(false),
+            updated: rec["modified_on"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                .unwrap_or_default(),
+        }))
+}
+
 /// 把 ip 写到 domain 的 A 记录(不存在则创建)。
 /// 强制灰云(proxied=false):若已存在橙云记录,更新时一并改为灰云。
 pub fn upsert_record(token: &str, zone_id: &str, domain: &str, ip: &str) -> WriteOutcome {

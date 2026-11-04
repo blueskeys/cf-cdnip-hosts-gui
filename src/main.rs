@@ -12,6 +12,8 @@ mod logger;
 mod privilege;
 mod selftest;
 mod speedtest;
+#[cfg(windows)]
+mod tray;
 
 use config::{Config, LastRun};
 use hosts::{HostsEntry, WriteJob, WriteMode, WriteOutcome};
