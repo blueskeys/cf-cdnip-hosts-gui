@@ -104,8 +104,8 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 enum AppEvent {
     Speedtest(SpeedtestEvent),
     WriteDone(WriteOutcome),
-    /// Cloudflare DNS 发布/验证完成;附带解析出的 zone_id(用于缓存)
-    CfDnsDone(WriteOutcome, Option<String>),
+    /// Cloudflare DNS 发布/验证完成;附带解析出的 zone_id(用于缓存)与发布的 IP(验证时为 None)
+    CfDnsDone(WriteOutcome, Option<String>, Option<String>),
     /// 当前 A 记录查询完成(Ok(None) = 记录不存在)
     CfRecordFetched(Result<Option<crate::cfapi::CfRecord>, String>),
 }
@@ -254,6 +254,17 @@ impl CfApp {
 
         // 内置定时器:以上次成功运行时间为基准恢复周期(重启不重置)
         let last_auto_at = cfg.last_run.at.as_deref().and_then(parse_local_dt);
+        // 「当前记录」优先用本地保存的上次发布 IP,无需启动就查 API
+        let cf_record = cfg.cf_dns.last_ip.clone().map_or(
+            CfRecordView::Unknown,
+            |ip| {
+                CfRecordView::Live(crate::cfapi::CfRecord {
+                    ip,
+                    proxied: false,
+                    updated: cfg.cf_dns.last_at.clone().unwrap_or_default(),
+                })
+            },
+        );
         let mut app = Self {
             cfg,
             log: Logger::new(),
@@ -275,7 +286,7 @@ impl CfApp {
             last_auto_at,
             ui_cfst_path,
             ui_cf_token,
-            cf_record: CfRecordView::Unknown,
+            cf_record,
             results_tab: ResultsTab::List,
             idle_since: Instant::now(),
             ws_trimmed: false,
@@ -378,7 +389,7 @@ impl CfApp {
                         format!("✗ {}", o.message)
                     };
                 }
-                AppEvent::CfDnsDone(o, zone) => {
+                AppEvent::CfDnsDone(o, zone, ip) => {
                     self.busy = None;
                     // 缓存 zone_id,后续发布少 1-2 次 API 查询
                     if let Some(z) = zone {
@@ -389,8 +400,22 @@ impl CfApp {
                     }
                     if o.ok {
                         self.log.info(&o.message);
-                        // 发布/验证成功后回查一次,「当前记录」行保持与 Cloudflare 一致
-                        self.fetch_cf_record_async(ctx);
+                        match ip {
+                            // 发布成功:IP 直接本地持久化并回显,不额外查 API
+                            Some(ip) => {
+                                let at = chrono::Local::now().format("%m-%d %H:%M").to_string();
+                                self.cfg.cf_dns.last_ip = Some(ip.clone());
+                                self.cfg.cf_dns.last_at = Some(at.clone());
+                                let _ = self.cfg.save();
+                                self.cf_record = CfRecordView::Live(crate::cfapi::CfRecord {
+                                    ip,
+                                    proxied: false,
+                                    updated: at,
+                                });
+                            }
+                            // 验证连接:回查一次 Cloudflare 侧真实值
+                            None => self.fetch_cf_record_async(ctx),
+                        }
                     } else {
                         self.log.error(&o.message);
                     }
@@ -599,7 +624,8 @@ impl CfApp {
                             ),
                             Err(e) => (None, WriteOutcome::fail(e)),
                         };
-                    let _ = tx.send(AppEvent::CfDnsDone(outcome, zone));
+                    // 验证连接:ip = None(不更新本地记录,改为自动查询真实值)
+                    let _ = tx.send(AppEvent::CfDnsDone(outcome, zone, None));
                     ectx.request_repaint();
                 });
             }
@@ -642,7 +668,7 @@ impl CfApp {
                             ),
                         },
                     };
-                    let _ = tx.send(AppEvent::CfDnsDone(outcome, zone));
+                    let _ = tx.send(AppEvent::CfDnsDone(outcome, zone, Some(best)));
                     ectx.request_repaint();
                 });
             }
@@ -798,7 +824,7 @@ impl CfApp {
                     } else {
                         log.error(&dns.message);
                     }
-                    let _ = tx.send(AppEvent::CfDnsDone(dns, zone));
+                    let _ = tx.send(AppEvent::CfDnsDone(dns, zone, Some(ip)));
                     ectx.request_repaint();
                 }
             }

@@ -8,9 +8,10 @@
 #   macOS  arm64   → macos-latest(M 系列)原生
 #   macOS  x64     → macos-latest 交叉编译 x86_64-apple-darwin(Apple SDK 双架构,
 #                    macos-13 Intel runner 已退役)
-#   Linux  x64     → ubuntu-latest 原生
-#   Linux  arm64   → ubuntu-24.04-arm 原生(公开仓库免费;私有仓库无权限时
-#                    可改为 ubuntu-latest + aarch64-linux-gnu 交叉编译)
+#   Linux  x64     → ubuntu-22.04 原生(glibc 2.35 基线,兼容 Ubuntu 22.04/24.04、Debian 12;
+#                    若用 ubuntu-latest=24.04 会依赖 glibc 2.39,22.04 无法运行)
+#   Linux  arm64   → ubuntu-22.04 交叉编译 aarch64-linux-gnu(同样 glibc 2.35 基线;
+#                    multiarch 装链接期所需的 arm64 wayland/xkbcommon,ports 仓库)
 name: release
 
 on:
@@ -40,10 +41,11 @@ jobs:
           - os: macos-latest
             artifact: cf-hosts-gui-macos-x64
             target: x86_64-apple-darwin
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             artifact: cf-hosts-gui-linux-x64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04
             artifact: cf-hosts-gui-linux-arm64
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,8 +56,16 @@ jobs:
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev
+          if [ -n "${{ matrix.target }}" ]; then
+            # arm64 交叉编译:multiarch 装链接期所需的 arm64 wayland/xkbcommon(来自 ports 仓库)
+            sudo dpkg --add-architecture arm64
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main universe" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+            sudo apt-get update
+            sudo apt-get install -y gcc-aarch64-linux-gnu libwayland-dev:arm64 libxkbcommon-dev:arm64
+          else
+            sudo apt-get update
+            sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev
+          fi
 
       - uses: Swatinem/rust-cache@v2 # 缓存 ~/.cargo 与 target,二次构建快数倍
         with:
@@ -67,6 +77,13 @@ jobs:
         run: |
           if [ -n "${{ matrix.target }}" ]; then
             rustup target add ${{ matrix.target }}
+            case "${{ matrix.target }}" in
+              aarch64-unknown-linux-gnu)
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                export PKG_CONFIG_ALLOW_CROSS=1
+                export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+                ;;
+            esac
             cargo build --release --locked --target ${{ matrix.target }}
           else
             cargo build --release --locked

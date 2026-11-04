@@ -66,6 +66,8 @@ unsafe extern "system" fn subclass_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
         );
         ShowWindow(hwnd, wm::SW_SHOW);
+        // 双保险:直接让任务栏移除按钮(TOOLWINDOW 样式只影响之后新建的按钮)
+        taskbar::delete_tab(hwnd);
         HIDDEN.store(true, Ordering::SeqCst);
         HIDDEN_ONCE.store(true, Ordering::SeqCst);
         if let Some(ctx) = CTX.get() {
@@ -131,6 +133,84 @@ fn subclass_main_window() {
     });
 }
 
+// ---------- 任务栏按钮控制(windows-sys 未暴露 vtable,手工声明 COM 接口) ----------
+
+mod taskbar {
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+    };
+
+    // CLSID_TaskbarList / IID_ITaskbarList,来自 Shell SDK 文档
+    const CLSID_TASKBARLIST: GUID = GUID {
+        data1: 0x56FDF344,
+        data2: 0xFD6D,
+        data3: 0x11D0,
+        data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+    };
+    const IID_ITASKBARLIST: GUID = GUID {
+        data1: 0x56FDF342,
+        data2: 0xFD6D,
+        data3: 0x11D0,
+        data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+    };
+
+    /// ITaskbarList vtable:IUnknown(3) + HrInit + AddTab + DeleteTab + ActivateTab + SetActiveAlt
+    #[repr(C)]
+    struct Vtbl {
+        _iunknown: [usize; 3],
+        hr_init: usize,
+        add_tab: usize,
+        delete_tab: usize,
+        _activate_tab: usize,
+        _set_active_alt: usize,
+    }
+    #[repr(C)]
+    struct Itf {
+        vtbl: *const Vtbl,
+    }
+
+    unsafe fn call(hwnd: HWND, add: bool) {
+        // 线程可能已初始化 COM(忽略返回值)
+        CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED as u32);
+        let mut itf: *mut Itf = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_TASKBARLIST,
+            std::ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_ITASKBARLIST,
+            &mut itf as *mut *mut Itf as *mut *mut core::ffi::c_void,
+        );
+        if hr != 0 || itf.is_null() {
+            return;
+        }
+        let v = (*itf).vtbl;
+        let hr_init: unsafe extern "system" fn(*mut Itf) -> i32 =
+            std::mem::transmute((*v).hr_init);
+        hr_init(itf);
+        let method: unsafe extern "system" fn(*mut Itf, HWND) -> i32 = std::mem::transmute(if add {
+            (*v).add_tab
+        } else {
+            (*v).delete_tab
+        });
+        method(itf, hwnd);
+        let release: unsafe extern "system" fn(*mut Itf) -> usize =
+            std::mem::transmute((*v)._iunknown[2]);
+        release(itf);
+    }
+
+    /// 让任务栏移除该窗口的按钮(窗口保持可见)
+    pub unsafe fn delete_tab(hwnd: HWND) {
+        call(hwnd, false);
+    }
+
+    /// 恢复任务栏按钮
+    pub unsafe fn add_tab(hwnd: HWND) {
+        call(hwnd, true);
+    }
+}
+
 // ---------- 托盘 ----------
 
 fn tray_show_window() {
@@ -162,6 +242,7 @@ fn tray_show_window() {
         );
         ShowWindow(h as HWND, wm::SW_HIDE);
         ShowWindow(h as HWND, wm::SW_SHOW);
+        taskbar::add_tab(h as HWND);
         SetForegroundWindow(h as HWND);
     }
 }

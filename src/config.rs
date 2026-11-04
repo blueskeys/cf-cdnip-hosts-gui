@@ -89,6 +89,11 @@ pub struct CfDnsConfig {
     pub domain: String,
     /// zone_id 缓存(「验证连接」时自动填写,避免每次逐级查询)
     pub zone_id: Option<String>,
+    /// 上次发布成功的 IP 与时间(「当前记录」行直接回显,无需每次查询 API)
+    #[serde(default)]
+    pub last_ip: Option<String>,
+    #[serde(default)]
+    pub last_at: Option<String>,
 }
 
 impl Default for CfDnsConfig {
@@ -98,6 +103,8 @@ impl Default for CfDnsConfig {
             api_token: String::new(),
             domain: String::new(),
             zone_id: None,
+            last_ip: None,
+            last_at: None,
         }
     }
 }
